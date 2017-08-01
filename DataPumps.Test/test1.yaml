@@ -1,0 +1,26 @@
+﻿# map
+source:
+    type: file
+    path: file1
+    delimiter: ","
+    columns:
+        -
+            name  : Name
+            type  : string
+        -
+            skip  : true
+        -
+            name  : Id
+            type  : integer
+
+destination:
+    type: file
+    path: file2
+    delimiter: "|"
+    columns:
+        -
+            name  : Id
+            type  : integer
+        -
+            name  : Name
+            type  : string

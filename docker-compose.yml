@@ -1,0 +1,8 @@
+version: '2'
+
+services:
+  kirke:
+    image: DataPumps
+    build:
+      context: ./DataPumps
+      dockerfile: Dockerfile
