@@ -25,12 +25,12 @@ namespace DataPumps
 
         private Int32 _defaultSize = 10;
 
-        public event WriteEventHandler WriteEvent;
-        public event FullEventHandler FullEvent;
-        public event EndEventHandler EndEvent;
-        public event ReleaseEventHandler ReleaseEvent;
-        public event EmptyEventHandler EmptyEvent;
-        public event SealedEventHandler SealedEvent;
+        public event Action<Object> WriteEvent;
+        public event Action<Object> ReleaseEvent;
+        public event Action FullEvent;
+        public event Action EndEvent;
+        public event Action EmptyEvent;
+        public event Action SealedEvent;
 
         public Buffer(BufferOptions options = null)
         {
@@ -70,7 +70,7 @@ namespace DataPumps
             return this;
         }
 
-        public async Task<Buffer> WriteAsync(Object data)
+        public async Task<Buffer> WriteAsync(Object data, CancellationToken? cancellationToken = null)
         {
             if (!IsFull)
             {
@@ -79,9 +79,14 @@ namespace DataPumps
 
             var promise = new TaskCompletionSource<Buffer>();
 
+            cancellationToken?.Register(() =>
+            {
+                promise.TrySetCanceled();
+            });
+
             ReleaseEvent += async _ =>
             {
-                promise.TrySetResult(await WriteAsync(data));
+                promise.SetResult(await WriteAsync(data, cancellationToken));
             };
 
             return await promise.Task;
@@ -107,19 +112,27 @@ namespace DataPumps
 
         public async Task<Object> ReadAsync(CancellationToken? cancellationToken = null)
         {
-            var p = new TaskCompletionSource<Object>(cancellationToken);
             if (!IsEmpty)
             {
-                p.SetResult(Read());
-                return await p.Task;
+                return await Task.FromResult(Read());
             }
-            
-            WriteEvent += async _ =>
-            {
-                p.SetResult(await ReadAsync(cancellationToken));
-            };
 
-            return await p.Task;
+            var promise = new TaskCompletionSource<Object>();
+
+            cancellationToken?.Register(() =>
+            {
+                promise.TrySetCanceled();
+            });
+
+            async void Handler(Object _)
+            {
+                promise.SetResult(await ReadAsync(cancellationToken));
+                WriteEvent -= Handler;
+            }
+
+            WriteEvent += Handler;
+
+            return await promise.Task;
         }
 
         public Buffer Seal()

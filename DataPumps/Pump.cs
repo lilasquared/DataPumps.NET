@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -17,24 +18,28 @@ namespace DataPumps
             Aborted
         }
 
+        public event EventHandler ErrorEvent;
+        public event EventHandler EndEvent;
+
         private const String OutputBufferName = "output";
 
-        private String _id;
         private PumpState _state;
         private Buffer _from;
+        private String _id;
+        private IDictionary<String, Buffer> _buffers;
         private CancellationTokenSource _currentRead;
+        private CancellationTokenSource _processing;
 
-        private readonly Buffer _errorBuffer;
         private readonly Boolean _debug;
-        private readonly IDictionary<String, Buffer> _buffers;
+
+        public Buffer ErrorBuffer { get; private set; }
 
         public Pump()
         {
             _state = PumpState.Stopped;
             _from = null;
             _id = null;
-            _errorBuffer = new Buffer();
-            _debug = false;
+            _debug = true;
 
             _buffers = new Dictionary<String, Buffer>
             {
@@ -56,13 +61,6 @@ namespace DataPumps
         {
             _id = id;
             return this;
-        }
-
-        public Buffer Buffer(String name = OutputBufferName)
-        {
-            if (!_buffers.ContainsKey(name)) throw new ArgumentOutOfRangeException($"No such buffer: {name}");
-
-            return _buffers[name];
         }
 
         public Pump AddBuffer(String name, Buffer buffer)
@@ -88,21 +86,21 @@ namespace DataPumps
                 throw new InvalidOperationException("Cannot change source buffer after pumping has started");
             }
 
-            _from = buffer ?? throw new ArgumentException(nameof(buffer));
+            _from = buffer ?? throw new ArgumentNullException(nameof(buffer));
             _registerFromEndEventHandler();
             return this;
         }
 
         public Pump From(Pump pump)
         {
-            _from = pump?.Buffer() ?? throw new ArgumentException(nameof(pump));
+            _from = pump?.Buffer() ?? throw new ArgumentNullException(nameof(pump));
             _registerFromEndEventHandler();
             return this;
         }
 
         public Pump From(IEnumerable<String> enumerable)
         {
-            if (enumerable == null) throw new ArgumentException(nameof(enumerable));
+            if (enumerable == null) throw new ArgumentNullException(nameof(enumerable));
 
             _from = new Buffer(new BufferOptions
             {
@@ -113,15 +111,70 @@ namespace DataPumps
             return this;
         }
 
-        public Pump To(Pump pump, String bufferName)
+        public void WriteError(String error)
         {
-            pump.From(Buffer(bufferName));
+            if (ErrorBuffer.IsFull)
+            {
+                return;
+            }
+
+            ErrorBuffer.Write(new PumpException(error, _id));
+        }
+
+        public void WriteError(AggregateException ex)
+        {
+            WriteError(ex?.InnerException?.Message);
+        }
+
+        public void SourceEnded()
+        {
+            _currentRead?.Cancel();
+        }
+
+        public IDictionary<String, Buffer> Buffers()
+        {
+            return _buffers;
+        }
+
+        public Pump Buffers(IDictionary<String, Buffer> buffers)
+        {
+            if (_state == PumpState.Started)
+            {
+                Abort();
+                throw new InvalidOperationException("Cannot change output buffers after pumping has been started");
+            }
+
+            _buffers = buffers;
             return this;
         }
 
-        public Pump Process(Func<Object, Task<Buffer>> process)
+        public Buffer Buffer(String name = OutputBufferName)
         {
-            _customProcess = process;
+            if (!_buffers.ContainsKey(name)) throw new ArgumentOutOfRangeException($"No such buffer: {name}");
+
+            return _buffers[name];
+        }
+
+        public Pump Buffer(String name, Buffer buffer)
+        {
+            if (_state == PumpState.Started)
+            {
+                Abort();
+                throw new InvalidOperationException("Cannot change output buffers after pumping has been started");
+            }
+
+            if (String.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentNullException(nameof(name));
+            }
+
+            _buffers[name] = buffer ?? throw new ArgumentNullException(nameof(buffer));
+            return this;
+        }
+
+        public Pump To(Pump pump, String bufferName)
+        {
+            pump.From(Buffer(bufferName));
             return this;
         }
 
@@ -129,17 +182,22 @@ namespace DataPumps
         {
             if (_from == null)
             {
-                throw new Exception("Source is not configured");
+                throw new MissingMemberException("Source is not configured");
             }
 
             if (_state != PumpState.Stopped)
             {
-                throw new Exception("Pump is already started");
+                throw new InvalidOperationException("Pump is already started");
             }
 
             if (_debug)
             {
                 Console.WriteLine($"{DateTime.Now} [{_id ?? "(root)"}] Pump started");
+            }
+
+            if (ErrorBuffer == null)
+            {
+                ErrorBuffer = new Buffer();
             }
 
             _state = PumpState.Started;
@@ -149,89 +207,107 @@ namespace DataPumps
             {
                 _buffers[key].EndEvent += _outputBufferEnded;
             }
+
             _pump();
-            return this;
-        }
-
-        public Pump Abort()
-        {
-            if (_state == PumpState.Aborted)
-            {
-                return this;
-            }
-
-            if (_state != PumpState.Started)
-            {
-                throw new Exception("Cannot .Abort() a pump that is not running");
-            }
-            _state = PumpState.Aborted;
-            return this;
-        }
-
-        public Pump WriteError(Object error)
-        {
-            if (_errorBuffer.IsFull)
-            {
-                return this;
-            }
-
-            // TODO: Errors or something?
-            _errorBuffer.Write(_id);
             return this;
         }
 
         private void _registerErrorBufferEvents()
         {
-            _errorBuffer.FullEvent += () =>
+            ErrorBuffer.FullEvent += () =>
             {
-                if (_state == PumpState.Started)
-                {
-                    Abort();
-                    // TODO Emit Error Event
-                }
+                if (_state != PumpState.Started) return;
+
+                Abort();
+                ErrorEvent?.Invoke(this, EventArgs.Empty);
             };
+        }
+
+        public Pump Abort()
+        {
+            if (_state == PumpState.Aborted) return this;
+
+            if (_state != PumpState.Started)
+            {
+                throw new InvalidOperationException("Cannot .Abort() a pump that is not running");
+            }
+            _state = PumpState.Aborted;
+            _processing?.Cancel();
+            return this;
         }
 
         private void _outputBufferEnded()
         {
-            throw new NotImplementedException();
+            if (_buffers.Values.All(buffer => !buffer.IsEnded)) return;
+
+            _state = PumpState.Ended;
+            if (_debug)
+            {
+                Console.WriteLine($"{DateTime.Now} [{_id ?? "(root)"}] Pump ended");
+            }
+            EndEvent?.Invoke(this, EventArgs.Empty);
         }
 
         private void _pump()
         {
-            if (_from.IsEnded) SealOutputBuffers();
-
-            if (_state == PumpState.Paused || _state == PumpState.Aborted)
+            if (_from.IsEnded)
             {
+                SealOutputBuffers();
                 return;
             }
 
+            if (_state == PumpState.Paused || _state == PumpState.Aborted) return;
+
             _currentRead = new CancellationTokenSource();
 
-            _from
-                .ReadAsync(_currentRead.Token)
-                .ContinueWith(async task =>
-                {
-                    _currentRead = null;
-                    await _process(task.Result);
-                    _pump();
-                });
+            _from.ReadAsync(_currentRead.Token)
+                .ContinueWith(ReadContinuation);
         }
 
-        private Func<Object, Task<Buffer>> _customProcess;
-
-        private async Task<Buffer> _process(Object data)
+        private async Task ReadContinuation(Task<Object> task)
         {
+            _currentRead = null;
+            if (task.Status == TaskStatus.RanToCompletion)
+            {
+                await _process(task.Result).ContinueWith(ProcessContinuation);
+            }
+            else
+            {
+                _pump();
+            }
+        }
+
+        private void ProcessContinuation(Task task)
+        {
+            if (task.IsFaulted)
+            {
+                WriteError(task.Exception);
+            }
+            _pump();
+        }
+
+        private Func<Object, Pump, CancellationToken, Task> _customProcess;
+
+        private async Task _process(Object data)
+        {
+            _processing = new CancellationTokenSource();
             if (_customProcess == null)
             {
-                return await Copy(data);
+                await Copy(data);
+                return;
             }
-            return await _customProcess(data);
+            await _customProcess(data, this, _processing.Token);
         }
 
-        private async Task<Buffer> Copy(Object data)
+        public Pump Process(Func<Object, Pump, CancellationToken, Task> process)
         {
-            return await Buffer().WriteAsync(data);
+            _customProcess = process;
+            return this;
+        }
+
+        private async Task Copy(Object data)
+        {
+            await Buffer().WriteAsync(data);
         }
 
         private void SealOutputBuffers()
@@ -245,9 +321,17 @@ namespace DataPumps
             }
         }
 
-        private void SourceEnded()
+        public async Task<Pump> WhenFinished()
         {
-            _currentRead?.Cancel();
+            if (IsEnded)
+            {
+                return await Task.FromResult(this);
+            }
+
+            var promise = new TaskCompletionSource<Pump>();
+            EndEvent += (sender, args) => promise.SetResult(sender as Pump);
+            ErrorEvent += (sender, args) => promise.SetException(new PumpingFailedException());
+            return await promise.Task;
         }
 
         private void _registerFromEndEventHandler()

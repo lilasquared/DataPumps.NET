@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Threading.Tasks;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Buffer = DataPumps.Buffer;
 
 namespace DataPumps.Test
 {
@@ -96,9 +95,9 @@ namespace DataPumps.Test
         {
             var buffer = new Buffer();
 
-            buffer.Write("test");
-
             await buffer.ReadAsync().ContinueWith(t => Assert.AreEqual("test", t.Result));
+
+            buffer.Write("test");
         }
     }
 }
